@@ -11,7 +11,7 @@
 # results compare across torch/ROCm versions; other workflows call this one
 # for a version matrix (workflow_call).
 #
-# Runners: AMD DevLab, a donated pool of ephemeral, single-use machines. One
+# Runners: AMD DevLab, a donated pool of single-use machines. One
 # job per machine; nothing persists between jobs.
 name: ROCm test (gfx1151, gfx1201)
 
