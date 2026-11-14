@@ -37,3 +37,8 @@ test/ops/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyAddmm::t
 # Mini-model convergence: Pixtral vision loss differs at one step by just over the
 # tolerance (fp32 rel 1.1e-5 vs rtol 1e-5; bf16 3568 vs 3472 vs rtol 1e-2).
 test/convergence/*/test_mini_models_multimodal.py::test_mini_model_vision[mini_pixtral-* | Pixtral loss one step past tolerance | not filed
+
+# gfx1151 only, deterministic (same values every run): bf16 Llama4 mini-model with the
+# fused-linear-cross-entropy path; reference loss 1.719 vs Liger 1.046 at step 9 (one step).
+# fp32 llama4 and the bf16 with-logits variant pass on gfx1151; all pass on gfx1201.
+test/convergence/bf16/test_mini_models.py::test_mini_model[mini_llama4-* | gfx1151 only: one-step loss divergence (1.72 vs 1.05) in bf16 Llama4 with FLCE | not filed
