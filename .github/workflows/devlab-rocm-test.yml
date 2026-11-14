@@ -1,0 +1,280 @@
+# Run Liger Kernel's own GPU tests on real consumer AMD GPUs.
+#
+# Liger's AMD lane (amd-ci.yml) targets an MI300X runner and is manual-only.
+# This adds a Radeon 8060S (Strix Halo, gfx1151) and a Radeon AI PRO R9700
+# (gfx1201): the same install as amd-ci.yml (torch for ROCm from
+# download.pytorch.org, then the [dev] extra) and the two suites it runs,
+# `make test` (correctness) and `make test-convergence`, each as a
+# deterministic sample.
+#
+# Every run uploads summary-*.json (versions, device, pass/fail counts) so
+# results compare across torch/ROCm versions; other workflows call this one
+# for a version matrix (workflow_call).
+#
+# Runners: AMD DevLab, a donated pool of ephemeral, single-use machines. One
+# job per machine; nothing persists between jobs.
+name: ROCm test (gfx1151, gfx1201)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      torch_index_url:
+        description: Index torch comes from
+        default: https://download.pytorch.org/whl/rocm7.2
+      tests_per_file:
+        description: Correctness test cases to run per test file (0 = all)
+        default: "25"
+      convergence_per_test:
+        description: Convergence cases to run per test function (0 = all)
+        default: "3"
+      pytest_k:
+        description: Optional pytest -k expression (e.g. to rerun one failing test in full)
+        default: ""
+  workflow_call:
+    inputs:
+      torch_spec: {type: string, default: "torch torchvision"}
+      torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm7.2}
+      tests_per_file: {type: string, default: "25"}
+      convergence_per_test: {type: string, default: "3"}
+      label: {type: string, default: release}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-test-${{ github.ref }}-${{ inputs.label || 'release' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 150
+    env:
+      TORCH_SPEC: ${{ inputs.torch_spec || 'torch torchvision' }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm7.2' }}
+      PER_FILE: ${{ inputs.tests_per_file || '25' }}
+      PER_CONV: ${{ inputs.convergence_per_test || '3' }}
+      PYTEST_K: ${{ inputs.pytest_k || '' }}
+      LABEL: ${{ inputs.label || 'release' }}
+      TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
+      SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write the test sampler
+        run: |
+          # A pytest plugin that keeps a deterministic sample at collection time:
+          # every pytest-xdist worker selects the same tests, and node ids never
+          # pass through the shell.
+          mkdir -p "$SAMPLER_DIR"
+          cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
+          import os
+          import sys
+          from collections import defaultdict
+
+          import pytest
+
+
+          def pytest_collection_modifyitems(config, items):
+              per = int(os.environ.get("DEVLAB_PER") or 0)
+              if per <= 0:
+                  return
+              by_file = os.environ.get("DEVLAB_GROUP", "function") == "file"
+              groups = defaultdict(list)
+              for item in items:
+                  nodeid = item.nodeid
+                  groups[nodeid.split("::")[0] if by_file else nodeid.split("[")[0]].append(item)
+              keep = set()
+              for members in groups.values():
+                  step = max(1, len(members) // per)
+                  keep.update(id(i) for i in members[::step][:per])
+              config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
+              items[:] = [i for i in items if id(i) in keep]
+
+
+          @pytest.hookimpl(wrapper=True, trylast=True)
+          def pytest_runtest_protocol(item, nextitem):
+              # A GPU fault (e.g. an illegal memory access) poisons the process's
+              # HIP context, and every later test on that xdist worker fails with
+              # it. Exit the worker instead; xdist reports the test and restarts it.
+              result = yield
+              torch = sys.modules.get("torch")
+              if os.environ.get("PYTEST_XDIST_WORKER") and torch is not None and torch.cuda.is_initialized():
+                  try:
+                      torch.cuda.synchronize()
+                  except Exception as exc:
+                      sys.stderr.write(f"devlab: GPU context lost after {item.nodeid}: {exc}\n")
+                      sys.stderr.flush()
+                      os._exit(3)
+              return result
+          PY
+
+      - name: Install torch and Liger Kernel
+        id: install
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC//\{gfx\}/${{ matrix.gfx }}}"     # torch[device-{gfx}] for TheRock
+          INDEX="$TORCH_INDEX_URL"
+          # A runner pool with a package mirror maps public indexes to it with the
+          # TORCH_INDEX_MAP repository variable (JSON: index URL -> mirror URL).
+          # Unset, the index is used as given.
+          EXTRA=()
+          if [ -n "${TORCH_INDEX_MAP:-}" ]; then
+            idx_in="$INDEX"
+            # A value is a mirror URL, or a list [index, extra index, ...] when the
+            # mirror serves the index's packages from more than one repository.
+            idx=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); u=sys.argv[2]; v=m.get(u.rstrip("/")+"/", m.get(u.rstrip("/"), u)); print("\n".join([v] if isinstance(v, str) else v))' "$TORCH_INDEX_MAP" "$INDEX")
+            mapfile -t idx <<<"$idx"
+            INDEX="${idx[0]}"
+            for e in "${idx[@]:1}"; do EXTRA+=(--extra-index-url "$e"); done
+            [ "$INDEX" = "$idx_in" ] && [ ${#idx[@]} -eq 1 ] || echo "torch index mapped: $idx_in -> $INDEX${EXTRA:+ (extra: ${idx[*]:1})}"
+          fi
+          echo "torch: $spec from $INDEX"
+          # PIP_CONFIG_FILE=/dev/null: a runner's pip.conf may add PyPI as an extra
+          # index, and PyPI's newer CUDA torch would then win over the ROCm one.
+          PIP_CONFIG_FILE=/dev/null pip install -q $spec --index-url "$INDEX" "${EXTRA[@]}"
+          # Pin the torch stack for every later pip call: a package that depends on
+          # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
+          # and the tests run on the CPU.
+          pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|triton-rocm|pytorch-triton-rocm|rocm[a-z0-9_-]*)==' \
+            > "$RUNNER_TEMP/torch-pin.txt"
+          # pytest-rerunfailures 15.1 can hang a session after a failure.
+          echo 'pytest-rerunfailures!=15.1' >> "$RUNNER_TEMP/torch-pin.txt"
+          cat "$RUNNER_TEMP/torch-pin.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
+          echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+          # Liger's own requirement is `triton`; ROCm torch ships Triton as
+          # triton-rocm / pytorch-triton-rocm, so pip would add PyPI's CUDA
+          # `triton` over the same module. Install Liger without its install
+          # requirements (the torch stack above provides them) and the [dev]
+          # extra on its own.
+          pip install -q --no-deps -e .
+          python - > "$RUNNER_TEMP/dev-reqs.txt" <<'PY'
+          from importlib.metadata import requires
+          for r in requires("liger_kernel") or []:
+              name, _, marker = r.partition(";")
+              if marker.replace(" ", "").replace("'", '"') == 'extra=="dev"':
+                  print(name.strip())
+          PY
+          cat "$RUNNER_TEMP/dev-reqs.txt"
+          pip install -q -r "$RUNNER_TEMP/dev-reqs.txt" pytest-timeout
+          python -u - <<'PY'
+          import faulthandler, json
+          faulthandler.enable()
+          from importlib.metadata import version, PackageNotFoundError
+          import torch, transformers, triton
+          assert torch.version.hip, f"not a ROCm build of torch: {torch.__version__}"
+          torch.cuda.init()
+          p = torch.cuda.get_device_properties(0)
+          backend = triton.runtime.driver.active.get_current_target().backend
+          dists = {}
+          for d in ("triton", "triton-rocm", "pytorch-triton-rocm"):
+              try:
+                  dists[d] = version(d)
+              except PackageNotFoundError:
+                  pass
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "triton": triton.__version__, "triton_dists": dists,
+                  "triton_backend": backend, "liger_kernel": version("liger_kernel"),
+                  "transformers": transformers.__version__}
+          print(info)
+          json.dump(info, open("env.json", "w"))
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          assert backend == "hip", f"Triton is not the ROCm build: backend={backend}, dists={dists}"
+          PY
+
+      - name: Correctness tests (make test, deterministic sample)
+        id: correctness
+        run: |
+          set -euo pipefail
+          . venv/bin/activate
+          k=()
+          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
+          # The paths `make test` runs. Two workers: several cases allocate most
+          # of the GPU, and the R9700 VMs have 32 GB of host RAM.
+          PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
+            python -m pytest test --ignore=test/convergence --ignore=test/cutedsl \
+            --ignore=test/cutile --ignore=test/cute -p devlab_sample -q -rfE \
+            -p no:cacheprovider -o log_cli=false --disable-warnings \
+            -n 2 --max-worker-restart=16 --timeout=900 --junitxml=junit-correctness.xml "${k[@]}"
+
+      - name: Convergence tests (make test-convergence, deterministic sample)
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          set -euo pipefail
+          . venv/bin/activate
+          k=()
+          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
+          # Serial, as upstream runs them: each case trains a mini model twice.
+          HF_DATASETS_OFFLINE=1 PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_CONV" DEVLAB_GROUP=function \
+            python -m pytest -p devlab_sample -q -rfE -p no:cacheprovider -o log_cli=false \
+            --disable-warnings --timeout=1200 --junitxml=junit-convergence.xml "${k[@]}" \
+            test/convergence/fp32/test_mini_models.py \
+            test/convergence/fp32/test_mini_models_multimodal.py \
+            test/convergence/fp32/test_mini_models_with_logits.py \
+            test/convergence/bf16/test_mini_models.py \
+            test/convergence/bf16/test_mini_models_multimodal.py \
+            test/convergence/bf16/test_mini_models_with_logits.py
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, xml.etree.ElementTree as ET
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception:
+                  return None
+          def junit(path):
+              if not os.path.exists(path):
+                  return None
+              s = ET.parse(path).getroot()
+              s = s if s.tag == "testsuite" else s.find("testsuite")
+              n = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+              return {"ran": n["tests"], "failed": n["failures"], "errors": n["errors"],
+                      "skipped": n["skipped"],
+                      "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
+                      "seconds": round(float(s.get("time", 0)), 1)}
+          suites = {k: junit(f"junit-{k}.xml") for k in ("correctness", "convergence")}
+          parts = [v for v in suites.values() if v]
+          tests = {k: round(sum(p[k] for p in parts), 1) for k in parts[0]} if parts else None
+          if tests:
+              tests["suites"] = suites
+          env = load("env.json") or {}
+          summary = {
+              "schema": 1, "project": "liger-kernel", "label": os.environ["LABEL"],
+              "release": env.get("liger_kernel", ""), "combo": f"torch{env.get('torch', '?')}",
+              "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
+              "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
+              "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
+              "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+          }
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          print(json.dumps(summary, indent=1))
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-${{ inputs.label || 'release' }}-${{ matrix.gpu }}-${{ github.run_attempt }}
+          path: |
+            summary.json
+            junit-*.xml
+          retention-days: 90
