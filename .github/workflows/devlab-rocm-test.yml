@@ -197,29 +197,37 @@ jobs:
           assert backend == "hip", f"Triton is not the ROCm build: backend={backend}, dists={dists}"
           PY
 
+      # The test steps never fail the job themselves: "Judge results" decides,
+      # so failures already classified as upstream (.github/devlab-known-failures.txt)
+      # show as warnings and only new failures turn the job red.
       - name: Correctness tests (make test, deterministic sample)
         id: correctness
         run: |
-          set -euo pipefail
+          set -uo pipefail
           . venv/bin/activate
           k=()
           [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
           # The paths `make test` runs. Two workers: several cases allocate most
           # of the GPU, and the R9700 VMs have 32 GB of host RAM.
+          rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
             python -m pytest test --ignore=test/convergence --ignore=test/cutedsl \
             --ignore=test/cutile --ignore=test/cute -p devlab_sample -q -rfE \
             -p no:cacheprovider -o log_cli=false --disable-warnings \
-            -n 2 --max-worker-restart=16 --timeout=900 --junitxml=junit-correctness.xml "${k[@]}"
+            -n 2 --max-worker-restart=16 --timeout=900 --junitxml=junit-correctness.xml "${k[@]}" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "pytest exit code: $rc"
 
       - name: Convergence tests (make test-convergence, deterministic sample)
+        id: convergence
         if: always() && steps.install.outcome == 'success'
         run: |
-          set -euo pipefail
+          set -uo pipefail
           . venv/bin/activate
           k=()
           [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
           # Serial, as upstream runs them: each case trains a mini model twice.
+          rc=0
           HF_DATASETS_OFFLINE=1 PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_CONV" DEVLAB_GROUP=function \
             python -m pytest -p devlab_sample -q -rfE -p no:cacheprovider -o log_cli=false \
             --disable-warnings --timeout=1200 --junitxml=junit-convergence.xml "${k[@]}" \
@@ -228,7 +236,65 @@ jobs:
             test/convergence/fp32/test_mini_models_with_logits.py \
             test/convergence/bf16/test_mini_models.py \
             test/convergence/bf16/test_mini_models_multimodal.py \
-            test/convergence/bf16/test_mini_models_with_logits.py
+            test/convergence/bf16/test_mini_models_with_logits.py || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "pytest exit code: $rc"
+
+      - name: Judge results
+        if: always()
+        env:
+          RC_CORRECTNESS: ${{ steps.correctness.outputs.rc }}
+          RC_CONVERGENCE: ${{ steps.convergence.outputs.rc }}
+        run: |
+          python3 - <<'PY'
+          # Known upstream failures are warnings; any other failure, or a suite
+          # that could not run (no junit, or pytest exiting other than 0/1), fails.
+          import fnmatch, json, os, xml.etree.ElementTree as ET
+          known = []
+          if os.path.exists(".github/devlab-known-failures.txt"):
+              for line in open(".github/devlab-known-failures.txt"):
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      pat, reason, issue = ([p.strip() for p in line.split("|")] + ["", ""])[:3]
+                      known.append((pat, reason, issue or "not filed"))
+          def nodeid(tc):
+              # junit classname "test.transformers.test_x.TestY" -> "test/transformers/test_x.py::TestY"
+              parts = (tc.get("classname") or "").split(".")
+              for i in range(len(parts), 0, -1):
+                  if os.path.exists("/".join(parts[:i]) + ".py"):
+                      return "::".join(["/".join(parts[:i]) + ".py"] + parts[i:] + [tc.get("name", "")])
+              return "::".join(p for p in (tc.get("classname"), tc.get("name")) if p)
+          broken, known_hit, new = [], [], []
+          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          for suite in ("correctness", "convergence"):
+              rc = os.environ.get(f"RC_{suite.upper()}", "")
+              path = f"junit-{suite}.xml"
+              if rc not in ("0", "1") or not os.path.exists(path):
+                  broken.append(f"{suite}: pytest exit code {rc or 'none'}, junit {'present' if os.path.exists(path) else 'missing'}")
+                  if not os.path.exists(path):
+                      continue
+              for tc in ET.parse(path).getroot().iter("testcase"):
+                  if tc.find("failure") is None and tc.find("error") is None:
+                      continue
+                  nid = nodeid(tc)
+                  hit = next((k for k in known if fnmatch.fnmatchcase(nid, k[0])), None)
+                  if hit:
+                      known_hit.append(nid)
+                      print(f"::warning title=Known upstream failure::{nid} — {hit[1]} ({hit[2]})")
+                      summary.write(f"- known upstream failure: `{nid}` — {hit[1]} ({hit[2]})\n")
+                  else:
+                      new.append(nid)
+                      print(f"::error title=New failure::{nid}")
+                      summary.write(f"- **new failure**: `{nid}`\n")
+          for b in broken:
+              print(f"::error title=Tests did not run::{b}")
+              summary.write(f"- **tests did not run**: {b}\n")
+          verdict = "fail" if (broken or new) else ("known-failures" if known_hit else "pass")
+          json.dump({"verdict": verdict, "known_failures": known_hit, "new_failures": new,
+                     "broken": broken}, open("judge.json", "w"), indent=1)
+          print(f"verdict: {verdict} ({len(known_hit)} known, {len(new)} new, {len(broken)} broken)")
+          raise SystemExit(1 if verdict == "fail" else 0)
+          PY
 
       - name: Write the run summary
         if: always()
@@ -256,11 +322,15 @@ jobs:
           if tests:
               tests["suites"] = suites
           env = load("env.json") or {}
+          judge = load("judge.json") or {}
           summary = {
               "schema": 1, "project": "liger-kernel", "label": os.environ["LABEL"],
               "release": env.get("liger_kernel", ""), "combo": f"torch{env.get('torch', '?')}",
               "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
               "gfx": "${{ matrix.gfx }}", "env": env or None, "smoke": None, "tests": tests,
+              "verdict": judge.get("verdict", "fail"),
+              "known_failures": judge.get("known_failures", []),
+              "new_failures": judge.get("new_failures", []),
               "job_status": "${{ job.status }}", "commit": "${{ github.sha }}",
               "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

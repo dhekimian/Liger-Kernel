@@ -1,0 +1,3 @@
+# Failures classified as upstream Liger Kernel issues on DevLab GPUs.
+# The DevLab workflow reports these as warnings; any other failure fails the job.
+# Format: <fnmatch pattern on the pytest node id> | <reason, one line> | <upstream issue URL, or "not filed">
