@@ -4,8 +4,8 @@
 # This adds a Radeon 8060S (Strix Halo, gfx1151) and a Radeon AI PRO R9700
 # (gfx1201): the same install as amd-ci.yml (torch for ROCm from
 # download.pytorch.org, then the [dev] extra) and the two suites it runs,
-# `make test` (correctness) and `make test-convergence`, each as a
-# deterministic sample.
+# `make test` (correctness) and `make test-convergence`, run exactly as the
+# Makefile defines them: serial, full suite, no sampling.
 #
 # Every run uploads summary-*.json (versions, device, pass/fail counts) so
 # results compare across torch/ROCm versions; other workflows call this one
@@ -23,15 +23,6 @@ on:
       torch_index_url:
         description: Index torch comes from
         default: https://download.pytorch.org/whl/rocm7.2
-      tests_per_file:
-        description: Correctness test cases to run per test file (0 = all)
-        default: "25"
-      convergence_per_test:
-        description: Convergence cases to run per test function (0 = all)
-        default: "3"
-      pytest_k:
-        description: Optional pytest -k expression (e.g. to rerun one failing test in full)
-        default: ""
       torch_spec:
         description: Torch requirements ({gfx} = the job's chip, for TheRock's torch[device-{gfx}])
         default: torch torchvision
@@ -42,8 +33,6 @@ on:
     inputs:
       torch_spec: {type: string, default: "torch torchvision"}
       torch_index_url: {type: string, default: https://download.pytorch.org/whl/rocm7.2}
-      tests_per_file: {type: string, default: "25"}
-      convergence_per_test: {type: string, default: "3"}
       label: {type: string, default: release}
 
 permissions:
@@ -65,69 +54,19 @@ jobs:
           - gpu: radeon-r9700
             gfx: gfx1201
     runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
-    timeout-minutes: 150
+    # Serial and unsampled, as upstream runs it: hours, mostly Triton compiling
+    # on one core.
+    timeout-minutes: 900
     env:
       TORCH_SPEC: ${{ inputs.torch_spec || 'torch torchvision' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || 'https://download.pytorch.org/whl/rocm7.2' }}
-      PER_FILE: ${{ inputs.tests_per_file || '25' }}
-      PER_CONV: ${{ inputs.convergence_per_test || '3' }}
-      PYTEST_K: ${{ inputs.pytest_k || '' }}
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
-      SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
       # Compile Triton kernels fresh in every job: a cache left on the host by an
       # earlier job or the image (another torch/Triton build) would decide what is tested.
       TRITON_CACHE_DIR: ${{ github.workspace }}/../triton-cache
     steps:
       - uses: actions/checkout@v4
-
-      - name: Write the test sampler
-        run: |
-          # A pytest plugin that keeps a deterministic sample at collection time:
-          # every pytest-xdist worker selects the same tests, and node ids never
-          # pass through the shell.
-          mkdir -p "$SAMPLER_DIR"
-          cat > "$SAMPLER_DIR/devlab_sample.py" <<'PY'
-          import os
-          import sys
-          from collections import defaultdict
-
-          import pytest
-
-
-          def pytest_collection_modifyitems(config, items):
-              per = int(os.environ.get("DEVLAB_PER") or 0)
-              if per <= 0:
-                  return
-              by_file = os.environ.get("DEVLAB_GROUP", "function") == "file"
-              groups = defaultdict(list)
-              for item in items:
-                  nodeid = item.nodeid
-                  groups[nodeid.split("::")[0] if by_file else nodeid.split("[")[0]].append(item)
-              keep = set()
-              for members in groups.values():
-                  step = max(1, len(members) // per)
-                  keep.update(id(i) for i in members[::step][:per])
-              config.hook.pytest_deselected(items=[i for i in items if id(i) not in keep])
-              items[:] = [i for i in items if id(i) in keep]
-
-
-          @pytest.hookimpl(wrapper=True, trylast=True)
-          def pytest_runtest_protocol(item, nextitem):
-              # A GPU fault (e.g. an illegal memory access) poisons the process's
-              # HIP context, and every later test on that xdist worker fails with
-              # it. Exit the worker instead; xdist reports the test and restarts it.
-              result = yield
-              torch = sys.modules.get("torch")
-              if os.environ.get("PYTEST_XDIST_WORKER") and torch is not None and torch.cuda.is_initialized():
-                  try:
-                      torch.cuda.synchronize()
-                  except Exception as exc:
-                      sys.stderr.write(f"devlab: GPU context lost after {item.nodeid}: {exc}\n")
-                      sys.stderr.flush()
-                      os._exit(3)
-              return result
-          PY
 
       - name: Install torch and Liger Kernel
         id: install
@@ -215,46 +154,37 @@ jobs:
       # The test steps never fail the job themselves: "Judge results" decides,
       # so failures already classified as upstream (.github/devlab-known-failures.txt)
       # show as warnings and only new failures turn the job red.
-      - name: Correctness tests (make test, deterministic sample)
+      #
+      # Each step runs the Makefile's own recipe (from `make -n`) so that pytest's exit
+      # code survives (make turns every failure into 2). PYTEST_ADDOPTS only adds
+      # outputs: a junit file, the failure list, no cache dir, and a 30-min per-test
+      # limit, which only ends a test that would otherwise hold the job until its limit.
+      - name: Correctness tests (make test)
         id: correctness
+        env:
+          PYTEST_ADDOPTS: --junitxml=junit-correctness.xml -rfE -p no:cacheprovider --timeout=1800
         run: |
           set -uo pipefail
           . venv/bin/activate
-          k=()
-          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
-          # The paths `make test` runs. Two workers: several cases allocate most
-          # of the GPU, and the R9700 VMs have 32 GB of host RAM.
-          # --timeout-method=thread: a test stuck in native code (a GPU wait or a
-          # Triton compile) never sees pytest-timeout's signal; the thread method
-          # dumps every stack and ends the worker, which xdist reports and replaces.
+          make -s -n test > "$RUNNER_TEMP/make-test.sh"
+          cat "$RUNNER_TEMP/make-test.sh"
           rc=0
-          PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
-            python -m pytest test --ignore=test/convergence --ignore=test/cutedsl \
-            --ignore=test/cutile --ignore=test/cute -p devlab_sample -q -rfE \
-            -p no:cacheprovider -o log_cli=false --disable-warnings \
-            -n 2 --max-worker-restart=16 --timeout=900 --timeout-method=thread --junitxml=junit-correctness.xml "${k[@]}" || rc=$?
+          bash "$RUNNER_TEMP/make-test.sh" || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "pytest exit code: $rc"
 
-      - name: Convergence tests (make test-convergence, deterministic sample)
+      - name: Convergence tests (make test-convergence)
         id: convergence
         if: always() && steps.install.outcome == 'success'
+        env:
+          PYTEST_ADDOPTS: --junitxml=junit-convergence.xml -rfE -p no:cacheprovider --timeout=1800
         run: |
           set -uo pipefail
           . venv/bin/activate
-          k=()
-          [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
-          # Serial, as upstream runs them: each case trains a mini model twice.
+          make -s -n test-convergence > "$RUNNER_TEMP/make-test-convergence.sh"
+          cat "$RUNNER_TEMP/make-test-convergence.sh"
           rc=0
-          HF_DATASETS_OFFLINE=1 PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_CONV" DEVLAB_GROUP=function \
-            python -m pytest -p devlab_sample -q -rfE -p no:cacheprovider -o log_cli=false \
-            --disable-warnings --timeout=1200 --junitxml=junit-convergence.xml "${k[@]}" \
-            test/convergence/fp32/test_mini_models.py \
-            test/convergence/fp32/test_mini_models_multimodal.py \
-            test/convergence/fp32/test_mini_models_with_logits.py \
-            test/convergence/bf16/test_mini_models.py \
-            test/convergence/bf16/test_mini_models_multimodal.py \
-            test/convergence/bf16/test_mini_models_with_logits.py || rc=$?
+          bash "$RUNNER_TEMP/make-test-convergence.sh" || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "pytest exit code: $rc"
 
