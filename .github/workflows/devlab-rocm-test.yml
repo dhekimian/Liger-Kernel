@@ -32,6 +32,12 @@ on:
       pytest_k:
         description: Optional pytest -k expression (e.g. to rerun one failing test in full)
         default: ""
+      torch_spec:
+        description: Torch requirements ({gfx} = the job's chip, for TheRock's torch[device-{gfx}])
+        default: torch torchvision
+      label:
+        description: Run label (summary name; runs with different labels do not cancel each other)
+        default: release
   workflow_call:
     inputs:
       torch_spec: {type: string, default: "torch torchvision"}
