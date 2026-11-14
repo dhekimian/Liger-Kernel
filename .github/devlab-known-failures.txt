@@ -21,7 +21,8 @@ test/convergence/*mini_glm4v_moe* | transformers 5.23 removed Glm4vMoeCausalLMOu
 # runs past the 900 s test timeout. gfx1151 and gfx1201 alike.
 test/transformers/test_mlp.py::test_correctness_* | LigerMLP gemm_swiglu autotune configs exceed 64 KB LDS (16-bit) / fp32 autotune exceeds 900 s | not filed
 
-# bf16 parity tests that need bit-identical math between Triton and torch eager:
+# bf16 parity tests that need bit-identical math between Triton and torch eager.
+# Only with torch 2.14 / triton 3.8 (rocm7.2, AMD rocm10.1); gone with torch 2.15 / triton 3.9.
 # ROCm's tanh/rsqrt differ from torch's by 1-2 ulp in fp32 (Triton's bf16 rounding is
 # correct RNE, checked), which flips single bf16 roundings past the tolerances.
 test/ops/test_rope.py::*dtype1-nvidia-triton* | bf16 rope: 1-ulp bf16 differences exceed atol/rtol 1e-2 | not filed
@@ -30,8 +31,9 @@ test/ops/test_norm_lora_parity.py::*dtype1] | bf16 weight-grad parity: a few ele
 test/transformers/test_modulated_rms_norm.py::test_correctness[*-dtype1-* | bf16 scale grad: 1-8 elements past atol 0.1/rtol 0.02 | not filed
 test/transformers/test_geglu.py::test_correctness[dtype1-* | bf16 GEGLU MLP output vs torch with atol/rtol 1e-2 on unscaled randn weights | not filed
 
-# Storage-lifetime test: one parameter combination fails per run, a different one each
-# time, on both GPUs (StorageWeakRef still alive). Not reproducible on demand.
+# Storage-lifetime test: one parameter combination fails in every run on both GPUs and
+# every ROCm line, but which one depends on what ran before it in the process (the sampled
+# run and the full-parameter run fail different ones). StorageWeakRef still alive.
 test/ops/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyAddmm::test_chunk_storage_released_before_next_chunk_and_final_cast* | flaky on ROCm: a chunk storage is still live at the check | not filed
 
 # Mini-model convergence: Pixtral vision loss differs at one step by just over the
