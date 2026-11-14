@@ -38,7 +38,12 @@ test/ops/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyAddmm::t
 # tolerance (fp32 rel 1.1e-5 vs rtol 1e-5; bf16 3568 vs 3472 vs rtol 1e-2).
 test/convergence/*/test_mini_models_multimodal.py::test_mini_model_vision[mini_pixtral-* | Pixtral loss one step past tolerance | not filed
 
-# gfx1151 only, deterministic (same values every run): bf16 Llama4 mini-model with the
-# fused-linear-cross-entropy path; reference loss 1.719 vs Liger 1.046 at step 9 (one step).
-# fp32 llama4 and the bf16 with-logits variant pass on gfx1151; all pass on gfx1201.
-test/convergence/bf16/test_mini_models.py::test_mini_model[mini_llama4-* | gfx1151 only: one-step loss divergence (1.72 vs 1.05) in bf16 Llama4 with FLCE | not filed
+# bf16 Llama4 mini-model: at one step the reference (transformers eager) loss spikes
+# (1.6-2.2) where Liger's stays at 1.0-1.4. Deterministic per stack; seen on gfx1151 with
+# torch 2.14+rocm7.2/10.1 and 2.15+rocm7.14, and on gfx1201 with 10.1 and 7.14; fp32 passes.
+test/convergence/bf16/test_mini_models.py::test_mini_model[mini_llama4-* | bf16 Llama4: one-step reference loss spike past tolerance | not filed
+test/convergence/bf16/test_mini_models_with_logits.py::test_mini_model[mini_llama4-* | bf16 Llama4: one-step reference loss spike past tolerance | not filed
+
+# fp32 fused neighborhood attention runs past the 900 s test timeout on gfx1201 with
+# torch 2.15 / triton 3.9 (rocm7.14 and rocm10.0); passes with torch 2.14 / triton 3.8 and on gfx1151.
+test/transformers/test_fused_neighborhood_attention.py::test_fused_neighborhood_attention_correctness[dtype0-* | gfx1201 + triton 3.9: fp32 case exceeds 900 s (hang or runaway compile) | not filed

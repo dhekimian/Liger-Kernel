@@ -75,6 +75,9 @@ jobs:
       LABEL: ${{ inputs.label || 'release' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
+      # Compile Triton kernels fresh in every job: a cache left on the host by an
+      # earlier job or the image (another torch/Triton build) would decide what is tested.
+      TRITON_CACHE_DIR: ${{ github.workspace }}/../triton-cache
     steps:
       - uses: actions/checkout@v4
 
@@ -130,6 +133,11 @@ jobs:
         id: install
         run: |
           set -euo pipefail
+          # Record a Triton cache already on this host (this job does not use it).
+          if [ -d "$HOME/.triton/cache" ]; then
+            echo "::notice::host already has a Triton cache: $(du -sh "$HOME/.triton/cache" | cut -f1), $(find "$HOME/.triton/cache" -mindepth 1 -maxdepth 1 | wc -l) entries"
+          fi
+          rm -rf "$TRITON_CACHE_DIR"
           python3 -m venv venv
           . venv/bin/activate
           pip install -q --upgrade pip
