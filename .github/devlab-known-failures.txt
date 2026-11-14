@@ -47,3 +47,9 @@ test/convergence/bf16/test_mini_models_with_logits.py::test_mini_model[mini_llam
 # fp32 fused neighborhood attention runs past the 900 s test timeout on gfx1201 with
 # torch 2.15 / triton 3.9 (rocm7.14 and rocm10.0); passes with torch 2.14 / triton 3.8 and on gfx1151.
 test/transformers/test_fused_neighborhood_attention.py::test_fused_neighborhood_attention_correctness[dtype0-* | gfx1201 + triton 3.9: fp32 case exceeds 900 s (hang or runaway compile) | not filed
+
+# gfx1151 only, intermittent: fp32 loss/metric of the fused score-centering loss differs
+# from the reference by ~0.3-5% (atol 1e-5) on 1-6 parametrizations in some runs and on
+# none in others; same seed, fresh Triton cache. Never seen on gfx1201. The Triton kernel
+# runs with num_warps=16 on HIP (fused_linear_score_centering.py:324).
+test/transformers/test_fused_linear_score_centering.py::test_correctness[*-dtype0-* | gfx1151 intermittent fp32 mismatch (0.3-5%) in score-centering loss | not filed
