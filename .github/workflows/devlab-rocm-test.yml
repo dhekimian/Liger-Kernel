@@ -210,12 +210,15 @@ jobs:
           [ -z "$PYTEST_K" ] || k=(-k "$PYTEST_K")
           # The paths `make test` runs. Two workers: several cases allocate most
           # of the GPU, and the R9700 VMs have 32 GB of host RAM.
+          # --timeout-method=thread: a test stuck in native code (a GPU wait or a
+          # Triton compile) never sees pytest-timeout's signal; the thread method
+          # dumps every stack and ends the worker, which xdist reports and replaces.
           rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FILE" DEVLAB_GROUP=file \
             python -m pytest test --ignore=test/convergence --ignore=test/cutedsl \
             --ignore=test/cutile --ignore=test/cute -p devlab_sample -q -rfE \
             -p no:cacheprovider -o log_cli=false --disable-warnings \
-            -n 2 --max-worker-restart=16 --timeout=900 --junitxml=junit-correctness.xml "${k[@]}" || rc=$?
+            -n 2 --max-worker-restart=16 --timeout=900 --timeout-method=thread --junitxml=junit-correctness.xml "${k[@]}" || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "pytest exit code: $rc"
 
