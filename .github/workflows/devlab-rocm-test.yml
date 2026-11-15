@@ -173,18 +173,58 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "pytest exit code: $rc"
 
-      - name: Convergence tests (make test-convergence)
+      - name: Convergence tests (make test-convergence, one process per file)
         id: convergence
         if: always() && steps.install.outcome == 'success'
         env:
-          PYTEST_ADDOPTS: --junitxml=junit-convergence.xml -rfE -p no:cacheprovider --timeout=1800
+          PYTEST_ADDOPTS: -rfE -p no:cacheprovider --timeout=1800
         run: |
           set -uo pipefail
           . venv/bin/activate
+          # The Makefile's recipe, with one change: each of its files runs in its own
+          # pytest process (same files, flags and order). In one process the suite keeps
+          # GPU tensors alive from test to test until a 32 GB GPU runs out of memory
+          # (finding 8 in the DevLab notes: ~30 GiB after ~75 tests; each file alone
+          # peaks near 5 GiB).
           make -s -n test-convergence > "$RUNNER_TEMP/make-test-convergence.sh"
           cat "$RUNNER_TEMP/make-test-convergence.sh"
-          rc=0
-          bash "$RUNNER_TEMP/make-test-convergence.sh" || rc=$?
+          mapfile -t words < <(python3 -c 'import shlex,sys; print(*[w for w in shlex.split(open(sys.argv[1]).read()) if w.strip()], sep=chr(10))' "$RUNNER_TEMP/make-test-convergence.sh")
+          base=(); files=()
+          for w in "${words[@]}"; do
+            case "$w" in *.py) files+=("$w") ;; *) base+=("$w") ;; esac
+          done
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no test files in the make test-convergence recipe"; exit 1; }
+          rc=0; i=0
+          for f in "${files[@]}"; do
+            i=$((i+1))
+            echo "::group::$f"
+            r=0
+            env "${base[@]}" "$f" --junitxml="junit-convergence-$i.xml" || r=$?
+            echo "::endgroup::"
+            echo "$f: pytest exit code $r"
+            # Keep the worst code: anything but 0/1 means the file could not run.
+            if [ "$r" -ne 0 ] && { [ "$r" -ne 1 ] || [ "$rc" -eq 0 ]; }; then rc=$r; fi
+            [ -f "junit-convergence-$i.xml" ] || rc=3
+          done
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          out = ET.Element("testsuites")
+          merged = ET.SubElement(out, "testsuite", name="convergence")
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          t = 0.0
+          for p in sorted(glob.glob("junit-convergence-*.xml"), key=lambda x: int(x.rsplit("-", 1)[1][:-4])):
+              root = ET.parse(p).getroot()
+              for suite in ([root] if root.tag == "testsuite" else root.findall("testsuite")):
+                  for k in tot:
+                      tot[k] += int(suite.get(k, 0))
+                  t += float(suite.get("time", 0))
+                  merged.extend(suite.findall("testcase"))
+          for k, v in tot.items():
+              merged.set(k, str(v))
+          merged.set("time", f"{t:.3f}")
+          ET.ElementTree(out).write("junit-convergence.xml")
+          print("merged convergence junit:", tot)
+          PY
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           echo "pytest exit code: $rc"
 
